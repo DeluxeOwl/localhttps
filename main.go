@@ -123,6 +123,8 @@ func main() {
 	k := koanf.New(".")
 	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
+	log.Info("loadded config", "ip", cfg.ip, "config_file", cfg.configFile)
+
 	if err := k.Load(file.Provider(".localhttps.yaml"), yaml.Parser()); err != nil {
 		log.Error("load config", "err", err)
 		os.Exit(1)
@@ -138,7 +140,7 @@ func main() {
 			log.Warn("invalid address type", "addr", addrInterface)
 			continue
 		}
-		log.Info("found domain-address pair", "domain", domain, "address", addr)
+		log.Info("found domain-address pair", "domain", domain, "address", addr, "url", fmt.Sprintf("https://%s", domain))
 		caddyfile.WriteString(buildCaddyReverseProxy(domain, addr))
 	}
 
