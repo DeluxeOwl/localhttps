@@ -71,8 +71,8 @@ type ManagedProcess struct {
 	name     string
 }
 
-func NewManagedProcess(name string, args ...string) (*ManagedProcess, error) {
-	logPath := filepath.Join(os.TempDir(), fmt.Sprintf("%s-%d.log", name, os.Getpid()))
+func NewManagedProcess(logName, name string, args ...string) (*ManagedProcess, error) {
+	logPath := filepath.Join(os.TempDir(), fmt.Sprintf("%s-%d.log", logName, os.Getpid()))
 	logFile, err := os.Create(logPath)
 	if err != nil {
 		return nil, fmt.Errorf("create log file: %w", err)
@@ -156,7 +156,7 @@ func startCaddy(caddyfile string) (*ManagedProcess, error) {
 	tmpFile.Close()
 
 	// Start Caddy with the config file
-	proc, err := NewManagedProcess(CaddyBinary, "run", "--config", tmpFile.Name())
+	proc, err := NewManagedProcess(CaddyBinary, CaddyBinary, "run", "--config", tmpFile.Name())
 	if err != nil {
 		os.Remove(tmpFile.Name())
 		return nil, fmt.Errorf("create caddy process: %w", err)
@@ -177,7 +177,7 @@ func startCaddy(caddyfile string) (*ManagedProcess, error) {
 }
 
 func startDNSSD(domain, ip string) (*ManagedProcess, error) {
-	proc, err := NewManagedProcess(fmt.Sprintf("%s-%s", DnsSDBinary, domain), "-P", domain, "_http._tcp", "local", "443", domain, ip)
+	proc, err := NewManagedProcess(fmt.Sprintf("%s-%s", DnsSDBinary, domain), DnsSDBinary, "-P", domain, "_http._tcp", "local", "443", domain, ip)
 	if err != nil {
 		return nil, fmt.Errorf("create dns-sd process: %w", err)
 	}
