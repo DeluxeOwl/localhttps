@@ -177,7 +177,7 @@ func startCaddy(caddyfile string) (*ManagedProcess, error) {
 }
 
 func startDNSSD(domain, ip string) (*ManagedProcess, error) {
-	proc, err := NewManagedProcess(DnsSDBinary, "-P", domain, "_http._tcp", "local", "443", domain, ip)
+	proc, err := NewManagedProcess(fmt.Sprintf("%s-%s", DnsSDBinary, domain), "-P", domain, "_http._tcp", "local", "443", domain, ip)
 	if err != nil {
 		return nil, fmt.Errorf("create dns-sd process: %w", err)
 	}
