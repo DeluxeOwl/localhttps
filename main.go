@@ -176,8 +176,12 @@ func startCaddy(caddyfile string) (*ManagedProcess, error) {
 	return proc, nil
 }
 
-func startDNSSD(domain, ip string) (*ManagedProcess, error) {
-	proc, err := NewManagedProcess(fmt.Sprintf("%s-%s", DnsSDBinary, domain), DnsSDBinary, "-P", domain, "_http._tcp", "local", "443", domain, ip)
+func startDNSSD(domain, ip string, log *slog.Logger) (*ManagedProcess, error) {
+	args := []string{"-P", domain, "_http._tcp", "local", "443", domain, ip}
+
+	log.Info("running", "cmd", fmt.Sprintf("%s %s", DnsSDBinary, strings.Join(args, " ")))
+
+	proc, err := NewManagedProcess(fmt.Sprintf("%s-%s", DnsSDBinary, domain), DnsSDBinary, args...)
 	if err != nil {
 		return nil, fmt.Errorf("create dns-sd process: %w", err)
 	}
@@ -218,7 +222,7 @@ func main() {
 			log.Warn("invalid address type", "addr", addrInterface)
 			continue
 		}
-		log.Info("found domain-address pair", "domain", domain, "address", addr, "url", fmt.Sprintf("https://%s", domain))
+		log.Info("found domain-address pair", "domain", domain, "to_proxy", addr, "url", fmt.Sprintf("https://%s", domain))
 		caddyfile.WriteString(buildCaddyReverseProxy(domain, addr))
 	}
 
@@ -232,7 +236,7 @@ func main() {
 	// Start DNS-SD for each domain
 	var dnsProcesses []*ManagedProcess
 	for domain := range flatMap {
-		dnsProc, err := startDNSSD(domain, cfg.ip)
+		dnsProc, err := startDNSSD(domain, cfg.ip, log)
 		if err != nil {
 			log.Error("failed to start dns-sd", "domain", domain, "err", err)
 			continue
