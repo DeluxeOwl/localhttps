@@ -1,17 +1,20 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log/slog"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
-	"github.com/go-cmd/cmd"
 	"github.com/knadh/koanf/parsers/yaml"
 	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/v2"
@@ -53,62 +56,137 @@ func parseFlags() (*Config, error) {
 func buildCaddyReverseProxy(domain, addr string) string {
 	return fmt.Sprintf(`
 %s {
+	bind 0.0.0.0
     tls internal
     reverse_proxy %s
 }
 `, domain, addr)
 }
 
-func startCaddy(caddyfile string, log *slog.Logger) *cmd.Cmd {
+type ManagedProcess struct {
+	cmd      *exec.Cmd
+	logFile  *os.File
+	done     chan error
+	stopOnce sync.Once
+	name     string
+}
+
+func NewManagedProcess(name string, args ...string) (*ManagedProcess, error) {
+	logPath := filepath.Join(os.TempDir(), fmt.Sprintf("%s-%d.log", name, os.Getpid()))
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		return nil, fmt.Errorf("create log file: %w", err)
+	}
+
+	fmt.Printf("Logs for %s being written to: %s\n", name, logPath)
+
+	cmd := exec.Command(name, args...)
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+
+	// Create process group for better control
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	return &ManagedProcess{
+		cmd:     cmd,
+		logFile: logFile,
+		done:    make(chan error, 1),
+		name:    name,
+	}, nil
+}
+
+func (p *ManagedProcess) Start() error {
+	if err := p.cmd.Start(); err != nil {
+		return fmt.Errorf("start process: %w", err)
+	}
+
+	go func() {
+		p.done <- p.cmd.Wait()
+	}()
+
+	return nil
+}
+
+func (p *ManagedProcess) Stop() error {
+	var stopErr error
+	p.stopOnce.Do(func() {
+		defer p.logFile.Close()
+
+		if p.cmd.Process == nil {
+			return
+		}
+
+		// Send SIGTERM first
+		stopErr = p.cmd.Process.Signal(syscall.SIGTERM)
+		if stopErr != nil {
+			return
+		}
+
+		// Wait for process to exit with timeout
+		select {
+		case <-p.done:
+			return
+		case <-time.After(3 * time.Second):
+			// If SIGTERM doesn't work, use SIGKILL
+			pgid, err := syscall.Getpgid(p.cmd.Process.Pid)
+			if err == nil {
+				syscall.Kill(-pgid, syscall.SIGKILL) // Negative pgid kills the whole process group
+			} else {
+				p.cmd.Process.Kill()
+			}
+			<-p.done // Wait for the process to be fully killed
+		}
+	})
+	return stopErr
+}
+
+// [Previous parseFlags, buildCaddyReverseProxy functions remain the same]
+
+func startCaddy(caddyfile string) (*ManagedProcess, error) {
 	// Write caddyfile to temporary file
 	tmpFile, err := os.CreateTemp("", "Caddyfile")
 	if err != nil {
-		log.Error("create temp file", "err", err)
-		return nil
+		return nil, fmt.Errorf("create temp file: %w", err)
 	}
 
 	if _, err := tmpFile.WriteString(caddyfile); err != nil {
-		log.Error("write caddyfile", "err", err)
-		return nil
+		os.Remove(tmpFile.Name())
+		return nil, fmt.Errorf("write caddyfile: %w", err)
 	}
-
-	if err := tmpFile.Close(); err != nil {
-		log.Error("close temp file", "err", err)
-		return nil
-	}
+	tmpFile.Close()
 
 	// Start Caddy with the config file
-	caddyCmd := cmd.NewCmd(CaddyBinary, "run", "--config", tmpFile.Name())
-	statusChan := caddyCmd.Start()
+	proc, err := NewManagedProcess(CaddyBinary, "run", "--config", tmpFile.Name())
+	if err != nil {
+		os.Remove(tmpFile.Name())
+		return nil, fmt.Errorf("create caddy process: %w", err)
+	}
 
-	// Monitor Caddy status
+	if err := proc.Start(); err != nil {
+		os.Remove(tmpFile.Name())
+		return nil, fmt.Errorf("start caddy: %w", err)
+	}
+
+	// Clean up temp file when process exits
 	go func() {
-		finalStatus := <-statusChan
-		if finalStatus.Error != nil {
-			log.Error("caddy process ended with error", "err", finalStatus.Error)
-		}
-		// Clean up temp file
+		<-proc.done
 		os.Remove(tmpFile.Name())
 	}()
 
-	return caddyCmd
+	return proc, nil
 }
 
-func startDNSSD(domain, ip string, log *slog.Logger) *cmd.Cmd {
-	dnsCmd := cmd.NewCmd(DnsSDBinary, "-P", domain, "_http._tcp", "local", "443", domain, ip)
-	statusChan := dnsCmd.Start()
+func startDNSSD(domain, ip string) (*ManagedProcess, error) {
+	proc, err := NewManagedProcess(DnsSDBinary, "-P", domain, "_http._tcp", "local", "443", domain, ip)
+	if err != nil {
+		return nil, fmt.Errorf("create dns-sd process: %w", err)
+	}
 
-	// Monitor DNS-SD status
-	go func() {
-		finalStatus := <-statusChan
-		if finalStatus.Error != nil {
-			log.Error("dns-sd process ended with error",
-				"domain", domain,
-				"err", finalStatus.Error)
-		}
-	}()
+	if err := proc.Start(); err != nil {
+		return nil, fmt.Errorf("start dns-sd: %w", err)
+	}
 
-	return dnsCmd
+	return proc, nil
 }
 
 func main() {
@@ -123,9 +201,9 @@ func main() {
 	k := koanf.New(".")
 	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
-	log.Info("loadded config", "ip", cfg.ip, "config_file", cfg.configFile)
+	log.Info("loaded config", "ip", cfg.ip, "config_file", cfg.configFile)
 
-	if err := k.Load(file.Provider(".localhttps.yaml"), yaml.Parser()); err != nil {
+	if err := k.Load(file.Provider(cfg.configFile), yaml.Parser()); err != nil {
 		log.Error("load config", "err", err)
 		os.Exit(1)
 	}
@@ -145,17 +223,21 @@ func main() {
 	}
 
 	// Start Caddy
-	caddyCmd := startCaddy(caddyfile.String(), log)
-	if caddyCmd == nil {
-		log.Error("failed to start caddy")
+	caddyProc, err := startCaddy(caddyfile.String())
+	if err != nil {
+		log.Error("failed to start caddy", "err", err)
 		os.Exit(1)
 	}
 
 	// Start DNS-SD for each domain
-	var dnsCommands []*cmd.Cmd
+	var dnsProcesses []*ManagedProcess
 	for domain := range flatMap {
-		dnsCmd := startDNSSD(domain, cfg.ip, log)
-		dnsCommands = append(dnsCommands, dnsCmd)
+		dnsProc, err := startDNSSD(domain, cfg.ip)
+		if err != nil {
+			log.Error("failed to start dns-sd", "domain", domain, "err", err)
+			continue
+		}
+		dnsProcesses = append(dnsProcesses, dnsProc)
 	}
 
 	// Wait for interrupt signal
@@ -163,26 +245,64 @@ func main() {
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	<-c
 
-	// Cleanup
+	// Cleanup with timeout
 	log.Info("shutting down...")
 
+	// Create a context with timeout for shutdown
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Create error channel for shutdown errors
+	shutdownErrs := make(chan error, 1+len(dnsProcesses))
+
+	// Stop all processes concurrently
+	var wg sync.WaitGroup
+
 	// Stop Caddy
-	err = caddyCmd.Stop()
-	if err != nil {
-		log.Error("failed to stop caddy")
-	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := caddyProc.Stop(); err != nil {
+			log.Error("failed to stop caddy", "err", err)
+			shutdownErrs <- fmt.Errorf("caddy: %w", err)
+		}
+	}()
 
 	// Stop all DNS-SD processes
-	var wg sync.WaitGroup
-	for _, dnsCmd := range dnsCommands {
+	for _, dnsProc := range dnsProcesses {
 		wg.Add(1)
-		go func(cmd *cmd.Cmd) {
+		go func(proc *ManagedProcess) {
 			defer wg.Done()
-			err = cmd.Stop()
-			if err != nil {
-				log.Error("failed to stop cmd")
+			if err := proc.Stop(); err != nil {
+				log.Error("failed to stop dns-sd", "err", err)
+				shutdownErrs <- fmt.Errorf("dns-sd: %w", err)
 			}
-		}(dnsCmd)
+		}(dnsProc)
 	}
-	wg.Wait()
+
+	// Wait for all processes to stop or timeout
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-ctx.Done():
+		log.Error("shutdown timed out")
+	case <-done:
+		log.Info("all processes stopped successfully")
+	}
+
+	// Check for any shutdown errors
+	close(shutdownErrs)
+	var errors []error
+	for err := range shutdownErrs {
+		errors = append(errors, err)
+	}
+
+	if len(errors) > 0 {
+		log.Error("errors during shutdown", "count", len(errors))
+		os.Exit(1)
+	}
 }
